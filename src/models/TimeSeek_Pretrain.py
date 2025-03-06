@@ -1,4 +1,4 @@
-__all__ = ['PatchTST']
+__all__ = ['TimeSeek']
 
 # Cell
 from typing import Callable, Optional
@@ -22,8 +22,23 @@ from einops import reduce, rearrange, repeat
 from src.callback.decompose import st_decompose
 
 
+import torchvision.models as models
+from torchvision.transforms import Resize
+from torchvision import transforms
+from PIL import Image
+
+class ImageEncoder(nn.Module):
+    def __init__(self, out_dim):
+        super().__init__()
+        self.encoder = models.resnet18(pretrained=True)
+        fc_features = self.encoder.fc.in_features
+        self.encoder.fc = nn.Linear(fc_features, out_dim)
+
+    def forward(self, x):
+        return self.encoder(x)
+
 # Cell
-class PatchTST(nn.Module):
+class TimeSeek(nn.Module):
     """
     Output dimension:
          [bs x target_dim x nvars] for prediction
@@ -49,6 +64,8 @@ class PatchTST(nn.Module):
         self.target_dim = target_dim
         self.out_patch_num = math.ceil(target_dim / patch_len)
         self.target_patch_len = target_patch_len
+        self.resize = Resize([224, 224], interpolation=Image.BILINEAR)
+        self.toPIL = transforms.ToPILImage()
 
         self.scale_conv1 = nn.Conv1d(in_channels=1, out_channels=1, kernel_size=2, stride=2, padding=0)
         self.scale_conv2 = nn.Conv1d(in_channels=1, out_channels=1, kernel_size=4, stride=4, padding=0)
@@ -63,25 +80,23 @@ class PatchTST(nn.Module):
         self.drop_out = nn.Dropout(dropout)
 
         # Encoder
-        ##这里可能不需要输入长度，直接去除掉
-        self.encoder_layer_scale2 = MOE_layers(self.num_patch / 4, d_model, n_heads, d_ff, e_layers)  ##最粗尺度
-        self.encoder_layer_scale1 = MOE_layers(self.num_patch / 2, d_model, n_heads, d_ff, e_layers)  ##中间尺度
-        self.encoder_layer_scale0 = MOE_layers(self.num_patch, d_model, n_heads, d_ff, e_layers)  ##最细尺度
+        self.encoder_layer_scale2 = MOE_layers(self.num_patch / 4, d_model, n_heads, d_ff, e_layers, num_slots=10)  ##最粗尺度
+        self.encoder_layer_scale1 = MOE_layers(self.num_patch / 2, d_model, n_heads, d_ff, e_layers, num_slots=10)  ##中间尺度
+        self.encoder_layer_scale0 = MOE_layers(self.num_patch, d_model, n_heads, d_ff, e_layers, num_slots=10)  ##最细尺度
+        self.image_encoder = ImageEncoder(d_model)
 
-        self.gatelayer = GateLayer(d_model)
+        self.gatelayer1 = GateLayer_new(d_model)
+        self.gatelayer2 = GateLayer_new(d_model)
 
-        ##1D反卷积
+        ##1D
         self.scale_convtranspose1 = nn.ConvTranspose1d(in_channels=d_model, out_channels=d_model, kernel_size=2,
                                                        stride=2)
         self.scale_convtranspose2 = nn.ConvTranspose1d(in_channels=d_model, out_channels=d_model, kernel_size=2,
                                                        stride=2)
 
-        # # Encoder
-        # self.encoder = TSTEncoder(d_model, n_heads, d_ff=d_ff, norm=norm, attn_dropout=attn_dropout, dropout=dropout,
-        #                           pre_norm=pre_norm, activation=act, res_attention=res_attention, n_layers=e_layers,
-        #                           store_attn=store_attn)
 
         # Decoder
+        self.decoder_linear = nn.Linear(d_model, d_model)
         self.decoder = Decoder(d_layers, patch_len=patch_len, d_model=d_model, n_heads=n_heads, d_ff=d_ff,
                                dropout=dropout)
 
@@ -104,12 +119,47 @@ class PatchTST(nn.Module):
         elif head_type == "classification":
             self.head = ClassificationHead(self.n_vars, d_model, target_dim, head_dropout)
 
+
+    def padding(self, x, periods):
+        bs, seq_len, n_vars = x.shape
+        if seq_len % periods != 0:
+            padding_left = periods - seq_len % periods
+            padding = torch.zeros([bs, padding_left, n_vars]).to(x.device)
+            return torch.cat([padding, x], dim=1)
+        else:
+            return x
+
+    def ts_resize(self, x):
+        '''
+        input: [bs, n_vars, num_patch, patch_len]
+        output: [bs*n_vars, 3, 224, 224]
+        '''
+        bs, num_patch, n_vars, patch_len = x.shape
+        seq_len = num_patch * patch_len
+
+        # flatten
+        x = x.permute(0, 1, 3, 2).reshape(bs, seq_len, n_vars)
+        # find period
+        periods, _ = FFT_for_Period(x, k=3)
+        periods = [24]
+        # padding
+        x = self.padding(x, periods[0])
+        # channel independent
+        x = x.permute(0, 2, 1).reshape(bs * n_vars, -1)
+        # resize
+        x_2d = x.reshape(-1, x.shape[-1] // periods[0], periods[0]).unsqueeze(1)
+        x_resize = self.resize(x_2d).expand(-1, 3, -1, -1)
+        # pic = self.toPIL(x_resize[0])
+        # pic.save('/home/Decoder_version_2/visualization/BeetleFly_top_2.jpg')
+
+        return x_resize
+
     def decoder_predict(self, bs, n_vars, dec_cross):
         """
         dec_cross: tensor [bs x  n_vars x num_patch x d_model]
         """
         # dec_in = self.decoder_embedding.expand(bs, n_vars, self.out_patch_num, -1)
-        dec_in = dec_cross[:, :, -1, :].unsqueeze(2).expand(-1, -1, self.out_patch_num, -1)
+        dec_in = self.decoder_linear(dec_cross[:, :, -1, :]).unsqueeze(2).expand(-1, -1, self.out_patch_num, -1)
         weights = self.get_dynamic_weights(self.out_patch_num).to(dec_in.device)
         dec_in = dec_in * weights.unsqueeze(0).unsqueeze(0).unsqueeze(-1)
 
@@ -133,9 +183,6 @@ class PatchTST(nn.Module):
         """
         seq_len = xb.shape[1]
         num_patch = (max(seq_len, patch_len) - patch_len) // stride + 1
-        # ##如果num_patch 为奇数，对最后一个patch复制
-        # if num_patch % 2 !=0:
-        #     xb = self.padding_patch_layer(xb.permute(0,2,1)).permute(0,2,1)
         tgt_len = patch_len + stride * (num_patch - 1)
         s_begin = seq_len - tgt_len
 
@@ -151,11 +198,13 @@ class PatchTST(nn.Module):
 
         x: tensor [bs x   T x nvars]
         z_masked: tensor [ bs x num_patch x n_vars x patch_len]
+        z_patch: tensor [bs x num_patch x n_vars x patch_len]
         """
 
-        x, z_masked, _ = z
+        x, z_masked, z_patch = z
         bs, l, nvars = x.shape
-        bs, num_patch, nvars, patch_len = z_masked.shape
+        z_new = torch.cat([z_masked, z_patch],dim=0)
+        bs_new, num_patch, nvars, patch_len = z_new.shape
         z2 = self.scale_conv2(x.reshape(bs * nvars, 1, l)).reshape(bs, -1, nvars)
         z1 = self.scale_conv1(x.reshape(bs * nvars, 1, l)).reshape(bs, -1, nvars)
         if z1.shape[1] < self.patch_len:
@@ -169,62 +218,85 @@ class PatchTST(nn.Module):
         z2, num_patch2 = self.create_patch(z2, self.patch_len, self.stride)
 
         cls_tokens = self.cls_embedding.expand(bs, nvars, -1, -1)
-        if z_masked.shape[1] < 4:
-            z_masked = self.embedding(z_masked).permute(0, 2, 1, 3)  # [bs x n_vars x num_patch x d_model]
+        # cls_tokens_new = self.cls_embedding.expand(bs_new, nvars, -1, -1)
+        z_2d = self.ts_resize(z_patch)
+        img_tokens = self.image_encoder(z_2d).reshape(bs, nvars, -1).unsqueeze(2)
+        cls_tokens_new = torch.cat([img_tokens, cls_tokens], dim=0)
+        if z_new.shape[1] < 4:
+            z_new = self.embedding(z_new).permute(0,2,1,3)
+            mean0 = torch.mean(z_new[bs:,:,:,:], dim=2).unsqueeze(2).expand(-1, -1, z_new.shape[2], -1)
+            mean0 = torch.cat([mean0, mean0], dim=0)
+            z_new = z_new - mean0
         else:
             if z1.shape[1] < 2:
                 z1 = self.embedding(z1).permute(0, 2, 1, 3)
+                mean1 = torch.mean(z1, dim=2).unsqueeze(2).expand(-1, -1, z1.shape[2], -1)
+                z1 = z1 - mean1
             else:
                 z2 = self.embedding(z2).permute(0, 2, 1, 3)
-                z2 = torch.cat((cls_tokens, z2), dim=2)
+                # z2 = torch.cat((cls_tokens, z2), dim=2)
                 z2 = self.drop_out(z2 + self.pos[:z2.shape[2], :])
                 z2 = self.drop_out(z2)
                 z2, b_l_2, d_l_2 = self.encoder_layer_scale2(z2)
-                z2 = self.scale_convtranspose2(z2[:, :, 1:, :].reshape(bs * nvars, self.d_model, -1)).reshape(bs, nvars,
-                                                                                                              -1,
-                                                                                                              self.d_model)
-                z2 = self.gatelayer(z2)
+                # z2 = self.scale_convtranspose2(z2[:, :, 1:, :].reshape(bs * nvars, self.d_model, -1)).reshape(bs, nvars,
+                #                                                                                               -1,
+                #                                                                                               self.d_model)
+                z2 = F.interpolate(z2[:, :, :, :], size=(self.num_patch // 2, self.d_model), mode='bilinear',
+                                   align_corners=False)
+
 
                 z1 = self.embedding(z1).permute(0, 2, 1, 3)
-
                 c2 = z2.shape[2]
                 c1 = z1.shape[2]
                 if c2 < c1:
                     z2 = torch.cat([z2, z2[:, :, -1, :].unsqueeze(2)], dim=2)
-                z1 = z1 + 0.1 * z2[:, :, :c1, :]
+                z1 = self.gatelayer1(z2[:,:,:c1,:], z1)
 
-            z1 = torch.cat((cls_tokens, z1), dim=2)
+                mean1 = torch.mean(z1, dim=2).unsqueeze(2).expand(-1, -1, c2, -1)
+                z1 = z1 - mean1
 
+            # z1 = torch.cat((cls_tokens, z1), dim=2)
             z1 = self.drop_out(z1 + self.pos[:z1.shape[2], :])
             z1, b_l_1, d_l_1 = self.encoder_layer_scale1(z1)
-            z1 = self.scale_convtranspose1(z1[:, :, 1:, :].reshape(bs * nvars, self.d_model, -1)).reshape(bs, nvars, -1,
-                                                                                                          self.d_model)
-            z1 = self.gatelayer(z1)
+            # z1[:, :, 1:, :] = z1[:, :, 1:, :] + mean1
+            z1 = z1 + mean1
+            z1 = F.interpolate(z1[:, :, :, :], size=(self.num_patch, self.d_model), mode='bilinear',
+                               align_corners=False)
 
-            z_masked = self.embedding(z_masked).permute(0, 2, 1, 3)  # [bs x n_vars x num_patch x d_model]
-
-            c = z_masked.shape[2]
-            if z1.shape[2] < z_masked.shape[2]:
+            z_new = self.embedding(z_new).permute(0, 2, 1, 3)  # [bs x n_vars x num_patch x d_model]
+            c = z_new.shape[2]
+            if z1.shape[2] < c:
                 z1 = torch.cat([z1, z1[:, :, -1, :].unsqueeze(2)], dim=2)
-            z_masked = z_masked + 0.1 * z1[:, :, :c, :]
+            z_new = self.gatelayer2(torch.cat([z1[:, :, :c, :], z1[:, :, :c, :]], dim=0), z_new)
 
 
-        z_masked = torch.cat((cls_tokens, z_masked), dim=2)  # [bs x n_vars x (1 + num_patch) x d_model]
-        z_masked = self.drop_out(z_masked + self.pos[:1 + self.num_patch, :])
-        z_masked, b_l, d_l = self.encoder_layer_scale0(z_masked)
+            mean0 = torch.mean(z_new[bs:, :, :, :], dim=2).unsqueeze(2).expand(-1, -1, c, -1)
+            mean0 = torch.cat([mean0, mean0], dim=0)
+            z_new = z_new - mean0
+
+        ##class_token
+        z_new = torch.cat((cls_tokens_new, z_new), dim=2)  # [bs x n_vars x (1 + num_patch) x d_model]
+        z_new = self.drop_out(z_new + self.pos[:1 + self.num_patch, :])
+        z_new, b_l, d_l = self.encoder_layer_scale0(z_new)
+        z_new[:, :, 1:, :] = z_new[:, :, 1:, :] + mean0
+
+        ##
+        z_masked = z_new[:bs, :, :, :]
+        z_patch = z_new[bs:, :, :, :]
         z_masked = torch.reshape(z_masked, (-1, nvars, 1 + self.num_patch, self.d_model))  # [bs, n_vars x num_patch x d_model]
+        z_patch = torch.reshape(z_patch, (-1, nvars, 1 + self.num_patch, self.d_model))
 
         # decoder_prediction
-        z_predict = self.decoder_predict(bs, nvars, z_masked)
+        z_predict = self.decoder_predict(bs, nvars, z_patch)
         z_predict = self.head(z_predict, patch_len)
         z_predict = z_predict.permute(0, 1, 3, 2)  # [bs x num_patch x patch_len x n_vars]
         z_predict = z_predict.reshape(z_predict.shape[0], -1, z_predict.shape[3])
         z_predict = z_predict[:, :self.target_dim, :]
 
-        # print(z_masked.shape)
 
         # recontruction
         z_reconstruct = self.head(z_masked[:, :, 1:, :].permute(0,1,3,2), patch_len)
+
 
         # z: [bs x target_dim x nvars] for prediction
         #    [bs x target_dim] for regression
@@ -378,3 +450,26 @@ class GateLayer(nn.Module):
         #print(gate_value.shape)
         #print(gate_value[0,0,:,0])
         return gate_value.sigmoid() * x
+
+
+class GateLayer_new(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.gate = nn.Linear(2*dim, 1)
+
+    def forward(self, x, y):
+        A = torch.cat([x,y], dim=-1)
+        gate_value = self.gate(A)
+        return gate_value.sigmoid() * x + y
+
+def FFT_for_Period(x, k=2):
+    # [B, T, C]
+    xf = torch.fft.rfft(x, dim=1)
+    # find period by amplitudes
+    frequency_list = abs(xf).mean(0).mean(-1)
+    frequency_list[0] = 0
+    _, top_list = torch.topk(frequency_list, k)
+    top_list = top_list.detach().cpu().numpy()
+    period = x.shape[1] // top_list
+    return period, abs(xf).mean(-1)[:, top_list]
+
