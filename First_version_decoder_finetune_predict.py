@@ -6,8 +6,7 @@ import pandas as pd
 import torch
 from torch import nn
 
-##这里替换成我们的模型MOE_Time
-from src.models.GenTS_fc import GenTS
+from src.models.TimeSeek_fc import TimeSeek
 #from src.models.patchTST_decoder_predict import PatchTST
 
 from src.learner import Learner, transfer_weights
@@ -100,7 +99,7 @@ def get_model(c_in, args, head_type, weight_path=None):
     print('number of patches:', num_patch)
     
     # get model
-    model = GenTS(c_in=c_in,
+    model = TimeSeek(c_in=c_in,
                 target_dim=args.target_points,
                 patch_len=args.patch_len,
                 stride=args.stride,

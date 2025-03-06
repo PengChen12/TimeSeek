@@ -7,7 +7,7 @@ import torch
 from torch import nn
 
 # from src.models.patchTST_decoder_cls import PatchTST
-from src.models.GenTS_cls import GenTS
+from src.models.TimeSeek_cls import TimeSeek
 from src.learner_cls import Learner, transfer_weights
 from src.callback.core import *
 from src.callback.tracking_cls import *
@@ -86,7 +86,7 @@ def get_model(c_in, args, head_type, weight_path=None):
     print('number of patches:', num_patch)
     
     # get model
-    model = GenTS(c_in=c_in,
+    model = TimeSeek(c_in=c_in,
                 target_dim=args.target_points,
                 patch_len=args.patch_len,
                 stride=args.stride,

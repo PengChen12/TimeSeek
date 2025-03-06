@@ -1,4 +1,4 @@
-__all__ = ['GenTS']
+__all__ = ['TimeSeek']
 
 # Cell
 from typing import Callable, Optional
@@ -26,7 +26,7 @@ from src.models.layers.cka import CudaCKA
 
 
 # Cell
-class GenTS(nn.Module):
+class TimeSeek(nn.Module):
     """
     Output dimension:
          [bs x target_dim x nvars] for prediction
@@ -50,7 +50,7 @@ class GenTS(nn.Module):
 
         # Basic
         self.num_patch = num_patch
-        self.target_dim = target_dim ###预测长度
+        self.target_dim = target_dim
         self.out_patch_num = math.ceil(target_dim / patch_len)
         self.is_finetune = is_finetune
         # if self.is_finetune == 0:
@@ -75,7 +75,6 @@ class GenTS(nn.Module):
         self.drop_out = nn.Dropout(dropout)
 
         # Encoder
-        ##这里可能不需要输入长度，直接去除掉
         self.encoder_layer_scale2 = MOE_layers(self.num_patch/4, d_model, n_heads, d_ff, e_layers, num_slots, channel_key) ##最粗尺度
         self.encoder_layer_scale1 = MOE_layers(self.num_patch/2, d_model, n_heads, d_ff, e_layers, num_slots, channel_key) ##中间尺度
         self.encoder_layer_scale0 = MOE_layers(self.num_patch, d_model, n_heads, d_ff, e_layers, num_slots, channel_key) ##最细尺度
@@ -83,13 +82,12 @@ class GenTS(nn.Module):
         self.gatelayer1 = GateLayer_new(d_model)
         self.gatelayer2 = GateLayer_new(d_model)
 
-        ##1D反卷积
+        ##1D
         self.scale_convtranspose1 = nn.ConvTranspose1d(in_channels=d_model, out_channels=d_model, kernel_size=2, stride=2)
         self.scale_convtranspose2 = nn.ConvTranspose1d(in_channels=d_model, out_channels=d_model, kernel_size=2, stride=2)
 
 
         # Decoder
-        ##这个不需要进行修改
         self.decoder_linear = nn.Linear(d_model, d_model)
         self.decoder = Decoder(d_layers, patch_len=patch_len, d_model=d_model, n_heads=n_heads, d_ff=d_ff,
                                attn_dropout=attn_dropout, dropout=dropout)
@@ -382,8 +380,6 @@ class GateLayer(nn.Module):
 
     def forward(self, x):
         gate_value = self.gate(x)
-        #print(gate_value.shape)
-        #print(gate_value[0,0,:,0])
         return gate_value.sigmoid() * x
 
 
@@ -401,15 +397,11 @@ class GateLayer_new(nn.Module):
 
 def causal_attention_mask(seq_length):
     """
-    创建一个因果注意力掩码。掩码中的每个位置 (i, j)
-    表示在计算第i个位置的attention时, 第j个位置是否可以被看见。
-    如果j <= i, 这个位置被设为1(可见), 否则设为0(不可见)。
-
     Args:
-        seq_length (int): 序列的长度
+        seq_length (int)
 
     Returns:
-        torch.Tensor: 因果注意力掩码，大小为 (seq_length, seq_length)
+        torch.Tensor: (seq_length, seq_length)
     """
     mask = torch.triu(torch.ones(seq_length, seq_length) * float('-inf'), diagonal=1)
     return mask
@@ -428,9 +420,7 @@ def resize(x, target_patch_len):
 class SE_Block(nn.Module):
     def __init__(self, inchannel, ratio=16):
         super(SE_Block, self).__init__()
-        # 全局平均池化(Fsq操作)
         self.gap = nn.AdaptiveAvgPool2d((1, 1))
-        # 两个全连接层(Fex操作)
         self.fc = nn.Sequential(
             nn.Linear(inchannel, inchannel // ratio, bias=False),  # 从 c -> c/r
             nn.ReLU(),
@@ -439,11 +429,7 @@ class SE_Block(nn.Module):
         )
 
     def forward(self, x):
-        # 读取批数据图片数量及通道数
         b, c, h, w = x.size()
-        # Fsq操作：经池化后输出b*c的矩阵
         y = self.gap(x).view(b, c)
-        # Fex操作：经全连接层输出（b，c，1，1）矩阵
         y = self.fc(y).view(b, c, 1, 1)
-        # Fscale操作：将得到的权重乘以原来的特征图x
         return x * y.expand_as(x)

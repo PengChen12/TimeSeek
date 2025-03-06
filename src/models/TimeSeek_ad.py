@@ -1,4 +1,4 @@
-__all__ = ['GenTS']
+__all__ = ['TimeSeek']
 
 # Cell
 from typing import Callable, Optional
@@ -12,41 +12,21 @@ from collections import OrderedDict
 from ..models.layers.pos_encoding import *
 from ..models.layers.basics import *
 from ..models.layers.attention import *
-from src.models.layers.decoder_orginal import Decoder
+from src.models.layers.decoder_cnn import Decoder
 from src.models.layers.MOE_scale_layer import MOE_layers
-
 import torch.fft as fft
 import math
 import numpy as np
 from einops import reduce, rearrange, repeat
 from src.callback.decompose import st_decompose
 
-import torchvision.models as models
-from torchvision.transforms import Resize
-from torchvision import transforms
-from PIL import Image
-
-
-class ImageEncoder(nn.Module):
-    def __init__(self, out_dim):
-        super().__init__()
-        # 1.调用模型
-        self.encoder = models.resnet18(pretrained=True)
-        # 2.提取fc层中固定的参数
-        fc_features = self.encoder.fc.in_features
-        # 3.修改输出的类别为10
-        self.encoder.fc = nn.Linear(fc_features, out_dim)
-
-    def forward(self, x):
-        return self.encoder(x)
-
 
 # Cell
-class GenTS(nn.Module):
+class TimeSeek(nn.Module):
     """
     Output dimension:
          [bs x target_dim x nvars] for prediction
-         [bs x target_dim] for regression
+         [bs x target_dim] for regressions
          [bs x target_dim] for classification
          [bs x num_patch x n_vars x patch_len] for pretrain
     """
@@ -57,44 +37,45 @@ class GenTS(nn.Module):
                  norm: str = 'BatchNorm', attn_dropout: float = 0., dropout: float = 0., act: str = "gelu",
                  res_attention: bool = True, pre_norm: bool = False, store_attn: bool = False,
                  pe: str = 'sincos', learn_pe: bool = False, head_dropout=0,
-                 head_type="prediction", individual=False, channel_key=1,
+                 head_type="prediction", individual=False, channel_key=1, is_finetune=0,
                  y_range: Optional[tuple] = None, verbose: bool = False, **kwargs):
 
         super().__init__()
-        assert head_type in ['pretrain', 'prediction', 'regression',
-                             'classification'], 'head type should be either pretrain, prediction, or regression'
+        assert head_type in ['pretrain', 'prediction', 'regression', 'classification',
+                             "anomalydetection"], 'head type should be either pretrain, prediction, or regression'
 
         # Basic
         self.num_patch = num_patch
         self.target_dim = target_dim
         self.out_patch_num = math.ceil(target_dim / patch_len)
-        self.resize = Resize([224, 224], interpolation=Image.BILINEAR)
-        self.toPIL = transforms.ToPILImage()
+        self.is_finetune = is_finetune
+        if self.is_finetune == 0:
+            self.target_patch_len = 48
+        else:
+            self.target_patch_len = patch_len
+        # self.target_patch_len = patch_len
+        self.patch_len = patch_len
+        self.stride = patch_len
 
         self.scale_conv1 = nn.Conv1d(in_channels=1, out_channels=1, kernel_size=2, stride=2, padding=0)
         self.scale_conv2 = nn.Conv1d(in_channels=1, out_channels=1, kernel_size=4, stride=4, padding=0)
 
-        self.padding_patch_layer = nn.ReplicationPad1d((0, patch_len))
-
         # Embedding
-        self.embedding = nn.Linear(patch_len, d_model)
+        self.embedding = nn.Linear(self.target_patch_len, d_model)
         self.decoder_embedding = nn.Parameter(torch.randn(1, 1, 1, d_model), requires_grad=True)
         self.cls_embedding = nn.Parameter(torch.randn(1, 1, 1, d_model), requires_grad=True)
 
         # Position Embedding
-        self.pos = positional_encoding(pe, learn_pe, 1 + num_patch, d_model)
+        self.pos = positional_encoding(pe, learn_pe, 1 + num_patch + self.out_patch_num, d_model)
         self.drop_out = nn.Dropout(dropout)
-        num_slots=10
+        num_slots = 10
 
         # Encoder
-        # self.encoder = TSTEncoder(d_model, n_heads, d_ff=d_ff, norm=norm, attn_dropout=attn_dropout, dropout=dropout,
-        #                           pre_norm=pre_norm, activation=act, res_attention=res_attention, n_layers=e_layers,
-        #                           store_attn=store_attn)
         self.encoder_layer_scale2 = MOE_layers(self.num_patch / 4, d_model, n_heads, d_ff, e_layers, num_slots, channel_key)  ##最粗尺度
         self.encoder_layer_scale1 = MOE_layers(self.num_patch / 2, d_model, n_heads, d_ff, e_layers, num_slots, channel_key)  ##中间尺度
         self.encoder_layer_scale0 = MOE_layers(self.num_patch, d_model, n_heads, d_ff, e_layers, num_slots, channel_key)  ##最细尺度
-        self.image_encoder = ImageEncoder(d_model)
 
+        # self.gatelayer = GateLayer(d_model)
         self.gatelayer1 = GateLayer_new(d_model)
         self.gatelayer2 = GateLayer_new(d_model)
 
@@ -104,14 +85,16 @@ class GenTS(nn.Module):
         self.scale_convtranspose2 = nn.ConvTranspose1d(in_channels=d_model, out_channels=d_model, kernel_size=2,
                                                        stride=2)
 
+        #Decoder
+        self.decoder = Decoder(d_layers, patch_len=patch_len, d_model=d_model, n_heads=n_heads, d_ff=d_ff,
+                               dropout=dropout)
+
         # Head
         self.n_vars = c_in
         self.head_type = head_type
         self.mask_mode = mask_mode
         self.mask_nums = mask_nums
         self.d_model = d_model
-        self.patch_len = patch_len
-        self.stride = patch_len
 
         if head_type == "pretrain":
             self.head = PretrainHead(d_model, patch_len,
@@ -122,40 +105,8 @@ class GenTS(nn.Module):
             self.head = RegressionHead(self.n_vars, d_model, target_dim, head_dropout, y_range)
         elif head_type == "classification":
             self.head = ClassificationHead(self.n_vars, d_model, target_dim, head_dropout)
-
-    def ts_resize(self, x):
-        '''
-        input: [bs, n_vars, num_patch, patch_len]
-        output: [bs*n_vars, 3, 224, 224]
-        '''
-        bs, num_patch, n_vars, patch_len = x.shape
-        seq_len = num_patch * patch_len
-
-        # flatten
-        x = x.permute(0, 1, 3, 2).reshape(bs, seq_len, n_vars)
-        # find period
-        periods, _ = FFT_for_Period(x, k=3)
-        periods = [24]
-        # padding
-        x = self.padding(x, periods[0])
-        # channel independent
-        x = x.permute(0, 2, 1).reshape(bs * n_vars, -1)
-        # resize
-        x_2d = x.reshape(-1, x.shape[-1] // periods[0], periods[0]).unsqueeze(1)
-        x_resize = self.resize(x_2d).expand(-1, 3, -1, -1)
-        pic = self.toPIL(x_resize[0])
-        # pic.save('/home/Decoder_version_2/visualization/BeetleFly_top_2.jpg')
-
-        return x_resize
-
-    def padding(self, x, periods):
-        bs, seq_len, n_vars = x.shape
-        if seq_len % periods != 0:
-            padding_left = periods - seq_len % periods
-            padding = torch.zeros([bs, padding_left, n_vars]).to(x.device)
-            return torch.cat([padding, x], dim=1)
-        else:
-            return x
+        elif head_type == "anomalydetection":
+            self.head = decoder_PredictHead(d_model, patch_len, self.target_patch_len, head_dropout)
 
     def decoder_predict(self, bs, n_vars, dec_cross):
         """
@@ -174,9 +125,6 @@ class GenTS(nn.Module):
         """
         seq_len = xb.shape[1]
         num_patch = (max(seq_len, patch_len) - patch_len) // stride + 1
-        # ##如果num_patch 为奇数，对最后一个patch复制
-        # if num_patch % 2 !=0:
-        #     xb = self.padding_patch_layer(xb.permute(0,2,1)).permute(0,2,1)
         tgt_len = patch_len + stride * (num_patch - 1)
         s_begin = seq_len - tgt_len
 
@@ -185,17 +133,16 @@ class GenTS(nn.Module):
 
         return xb, num_patch
 
-
     def forward(self, z):
         """
         z: tensor [bs x num_patch x n_vars x patch_len]
         """
 
         bs, l, nvars = z.shape
-        ##降采样
+        ##
         z2 = self.scale_conv2(z.reshape(bs * nvars, 1, l)).reshape(bs, -1, nvars)
         z1 = self.scale_conv1(z.reshape(bs * nvars, 1, l)).reshape(bs, -1, nvars)
-
+        # print(z1.shape)
         if z.shape[1] < self.patch_len:
             padding = torch.zeros([z.shape[0], self.patch_len - z.shape[1], z.shape[2]]).to(z.device)
             z = torch.cat((z, padding), dim=1)
@@ -210,22 +157,20 @@ class GenTS(nn.Module):
         z1, num_patch1 = self.create_patch(z1, self.patch_len, self.stride)
         z2, num_patch2 = self.create_patch(z2, self.patch_len, self.stride)
 
+        if self.is_finetune == 0:  ##zero-shot
+            z = resize(z, self.target_patch_len)
+            z1 = resize(z1, self.target_patch_len)
+            z2 = resize(z2, self.target_patch_len)
 
         bs, num_patch, n_vars, patch_len = z.shape
-
-        # x_2d
-        z_2d = self.ts_resize(z)
-        img_tokens = self.image_encoder(z_2d).reshape(bs, nvars, -1).unsqueeze(2)
         cls_tokens = self.cls_embedding.expand(bs, n_vars, -1, -1)
-
-        bs, num_patch, n_vars, patch_len = z.shape
-        if z.shape[1]<24:
+        if z.shape[1] < 8:
             z = self.embedding(z).permute(0, 2, 1, 3)  # [bs x n_vars x num_patch x d_model]
             mean0 = torch.mean(z, dim=2).unsqueeze(2).expand(-1, -1, z.shape[2], -1)
             z = z - mean0
         else:
-            if z1.shape[1]<12:
-                z1 = self.embedding(z1).permute(0,2,1,3)
+            if z1.shape[1] < 4:
+                z1 = self.embedding(z1).permute(0, 2, 1, 3)
                 mean1 = torch.mean(z1, dim=2).unsqueeze(2).expand(-1, -1, z1.shape[2], -1)
                 z1 = z1 - mean1
             else:
@@ -236,45 +181,69 @@ class GenTS(nn.Module):
                 z2, b_l_2, d_l_2 = self.encoder_layer_scale2(z2)
                 z2 = F.interpolate(z2[:, :, 1:, :], size=(self.num_patch // 2, self.d_model), mode='bilinear',
                                    align_corners=False)
+                # z2 = self.scale_convtranspose2(z2[:, :, 1:, :].reshape(bs * nvars, self.d_model, -1)).reshape(bs, nvars,
+                #                                                                                               -1,
+                #                                                                                               self.d_model)
+                # z2 = self.gatelayer1(z2)
+                #
+                # z1 = self.embedding(z1).permute(0, 2, 1, 3)
+                #
+                # c2 = z2.shape[2]
+                # c1 = z1.shape[2]
+                # if c2 < c1:
+                #     z2 = torch.cat([z2, z2[:, :, -1, :].unsqueeze(2)], dim=2)
+                # z1 = z1 + 0.1 * z2[:, :, :c1, :]
 
                 z1 = self.embedding(z1).permute(0, 2, 1, 3)
                 c2 = z2.shape[2]
-                c1 = z1.shape[2]
-                if c2 < c1:
-                    z2 = torch.cat([z2, z2[:, :, -1, :].unsqueeze(2)], dim=2)
-                z1 = self.gatelayer1(z2[:,:,:c1,:], z1)
+                z1 = z1.clone()
+                z1[:, :, :c2, :] = self.gatelayer1(z2, z1[:, :, :c2, :])
                 mean1 = torch.mean(z1, dim=2).unsqueeze(2).expand(-1, -1, c2, -1)
                 z1 = z1 - mean1
 
             z1 = torch.cat((cls_tokens, z1), dim=2)
+
             z1 = self.drop_out(z1 + self.pos[:z1.shape[2], :])
             z1, b_l_1, d_l_1 = self.encoder_layer_scale1(z1)
             z1[:, :, 1:, :] = z1[:, :, 1:, :] + mean1
+
+            # z1 = self.scale_convtranspose1(z1[:, :, 1:, :].reshape(bs * nvars, self.d_model, -1)).reshape(bs, nvars, -1,
+            #                                                                                               self.d_model)
 
             z1 = F.interpolate(z1[:, :, 1:, :], size=(self.num_patch, self.d_model), mode='bilinear',
                                align_corners=False)
 
             z = self.embedding(z).permute(0, 2, 1, 3)  # [bs x n_vars x num_patch x d_model]
-            c = z.shape[2]
             c1 = z1.shape[2]
-            if z1.shape[2] < z.shape[2]:
-                z1 = torch.cat([z1, z1[:, :, -1, :].unsqueeze(2)], dim=2)
-            z = self.gatelayer2(z1[:, :, :c, :], z)
+            z = z.clone()
+            z[:, :, :c1, :] = self.gatelayer2(z1, z[:, :, :c1, :])
 
-            ##计算均值
-            mean0 = torch.mean(z, dim=2).unsqueeze(2).expand(-1, -1, c, -1)
+            ##
+            mean0 = torch.mean(z, dim=2).unsqueeze(2).expand(-1, -1, c1, -1)
             z = z - mean0
 
 
+            # z1 = self.gatelayer(z1)
+            #
+            # z = self.embedding(z).permute(0, 2, 1, 3)  # [bs x n_vars x num_patch x d_model]
+            #
+            # c = z.shape[2]
+            # if z1.shape[2] < z.shape[2]:
+            #     z1 = torch.cat([z1, z1[:, :, -1, :].unsqueeze(2)], dim=2)
+            # z = z + 0.1 * z1[:, :, :c, :]
+
+        # print(z.shape)
+
         z = torch.cat((cls_tokens, z), dim=2)  # [bs x n_vars x (1 + num_patch) x d_model]
         z = self.drop_out(z + self.pos[:1 + self.num_patch, :])
+
         z, b_l, d_l = self.encoder_layer_scale0(z)
         z[:, :, 1:, :] = z[:, :, 1:, :] + mean0
         z = torch.reshape(z, (-1, n_vars, 1 + self.num_patch, self.d_model))  # [bs, n_vars x num_patch x d_model]
 
 
         # predict
-        z = self.head(z.transpose(2, 3))
+        z = self.head(z[:, :, 1:, :].transpose(2, 3))
 
         # z: [bs x target_dim x nvars] for prediction
         #    [bs x target_dim] for regression
@@ -297,7 +266,7 @@ class RegressionHead(nn.Module):
         x: [bs x nvars x d_model x num_patch]
         output: [bs x output_dim]
         """
-        x = x[:, :, :, 0]  # only consider the last item in the sequence, x: bs x nvars x d_model
+        x = x[:, :, :, -1]  # only consider the last item in the sequence, x: bs x nvars x d_model
         x = self.flatten(x)  # x: bs x nvars * d_model
         x = self.dropout(x)
         y = self.linear(x)  # y: bs x output_dim
@@ -309,48 +278,20 @@ class ClassificationHead(nn.Module):
     def __init__(self, n_vars, d_model, n_classes, head_dropout):
         super().__init__()
         self.flatten = nn.Flatten(start_dim=1)
-        self.linear = ProjectionHead(n_vars * d_model, n_classes, 128)
+        self.dropout = nn.Dropout(head_dropout)
+        self.linear = nn.Linear(n_vars * d_model, n_classes)
 
     def forward(self, x):
         """
         x: [bs x nvars x d_model x num_patch]
         output: [bs x n_classes]
         """
-        bs, n_vars, d_model, num_patch = x.shape
-
-        x = x[:, :, :, 0]  # only consider the First item in the sequence, x: bs x nvars x d_model
-        # x = torch.mean(x, dim = -1)
-
-        # x = torch.mean(x, dim = -1)
-        # x = x.reshape(bs*n_vars, d_model, -1)
-        # x = torch.max_pool1d(x, num_patch).squeeze(-1)
-        # x = x.reshape(bs, n_vars, d_model)
-
-        x = x.reshape(bs, n_vars * d_model)
+        x = x[:, :, :, 0]  # only consider the first item in the sequence, x: bs x nvars x d_model
         x = self.flatten(x)  # x: bs x nvars * d_model
+        x = self.dropout(x)
         y = self.linear(x)  # y: bs x n_classes
+
         return y
-
-
-class ProjectionHead(nn.Module):
-    def __init__(self, input_dims, output_dims, hidden_dims=128):
-        super().__init__()
-        self.input_dims = input_dims
-        self.output_dims = output_dims
-        self.hidden_dims = hidden_dims
-
-        # projection head for finetune
-        self.proj_head = nn.Sequential(
-            nn.Linear(input_dims, hidden_dims),
-            nn.BatchNorm1d(hidden_dims),
-            nn.ReLU(),
-            nn.Linear(hidden_dims, output_dims)
-        )
-        self.repr_dropout = nn.Dropout(p=0.1)
-
-    def forward(self, x):
-        x = self.repr_dropout(self.proj_head(x))
-        return x
 
 
 class PredictionHead(nn.Module):
@@ -414,10 +355,11 @@ class PretrainHead(nn.Module):
 
 
 class decoder_PredictHead(nn.Module):
-    def __init__(self, d_model, patch_len, dropout):
+    def __init__(self, d_model, patch_len, target_patch_len, dropout):
         super().__init__()
         self.dropout = nn.Dropout(dropout)
-        self.linear = nn.Linear(d_model, patch_len)
+        self.linear = nn.Linear(d_model, target_patch_len)
+        self.patch_len = patch_len
 
     def forward(self, x):
         """
@@ -427,10 +369,9 @@ class decoder_PredictHead(nn.Module):
 
         x = x.transpose(2, 3)  # [bs x nvars x num_patch x d_model]
         x = self.linear(self.dropout(x))  # [bs x nvars x num_patch x patch_len]
+        x = resize(x, target_patch_len=self.patch_len)
         x = x.permute(0, 2, 3, 1)  # [bs x num_patch x  x patch_len x nvars]
         return x.reshape(x.shape[0], -1, x.shape[3])
-
-
 
 class GateLayer(nn.Module):
     def __init__(self, dim, init_values=1e-5, inplace=False):
@@ -445,19 +386,6 @@ class GateLayer(nn.Module):
         return gate_value.sigmoid() * x
 
 
-def FFT_for_Period(x, k=2):
-    # [B, T, C]
-    xf = torch.fft.rfft(x, dim=1)
-    # find period by amplitudes
-    frequency_list = abs(xf).mean(0).mean(-1)
-    frequency_list[0] = 0
-    _, top_list = torch.topk(frequency_list, k)
-    top_list = top_list.detach().cpu().numpy()
-    period = x.shape[1] // top_list
-    return period, abs(xf).mean(-1)[:, top_list]
-
-
-
 class GateLayer_new(nn.Module):
     def __init__(self, dim):
         super().__init__()
@@ -467,3 +395,12 @@ class GateLayer_new(nn.Module):
         A = torch.cat([x,y], dim=-1)
         gate_value = self.gate(A)
         return gate_value.sigmoid() * x + y
+
+def resize(x, target_patch_len):
+    '''
+    x: tensor [bs x num_patch x n_vars x patch_len]]
+    '''
+    bs, num_patch, n_vars, patch_len = x.shape
+    x = x.reshape(bs * num_patch, n_vars, patch_len)
+    x = F.interpolate(x, size=target_patch_len, mode='linear', align_corners=False)
+    return x.reshape(bs, num_patch, n_vars, target_patch_len)
